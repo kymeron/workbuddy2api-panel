@@ -90,7 +90,7 @@ func TestToolCallArgumentsSanitized(t *testing.T) {
 			}},
 		}},
 	}
-	if !sanitizeMessages(msgs) {
+	if !sanitizeMessages(msgs, false) {
 		t.Fatal("sanitizeMessages 未报告任何改动，tool_calls 被跳过")
 	}
 	fn := msgs[1].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
@@ -190,7 +190,7 @@ func TestMultimodalTextPartOnly(t *testing.T) {
 		map[string]any{"type": "text", "text": ccIdentity},
 		imgPart,
 	}
-	out, changed := sanitizeContent(content)
+	out, changed := sanitizeContent(content, false)
 	if !changed {
 		t.Fatal("expected change")
 	}
@@ -377,7 +377,7 @@ func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 		"content":   "hi",
 		"reasoning": "upstream said 11128",
 	}}
-	if !sanitizeMessages(ms) {
+	if !sanitizeMessages(ms, false) {
 		t.Fatal("reasoning 字段里的指纹未被净化")
 	}
 	got, _ := ms[0].(map[string]any)["reasoning"].(string)
@@ -390,4 +390,207 @@ func TestSanitizeMessagesScrubsReasoningField(t *testing.T) {
 func newTestUpstream(t *testing.T, h http.HandlerFunc) *httptest.Server {
 	t.Helper()
 	return httptest.NewServer(h)
+}
+
+// DSH（DeepSeek Harness）的身份句是**短语级**指纹：上游按逐字匹配把它当成
+// 「非官方渠道调用」整单拦截（400 11-128 Illegal API invocation from an
+// unapproved channel）。换一词即绕过，语义不变。
+//
+// 回归点（issue：DSH 接入报 11128）：本表若无此规则，DSH 的 system 提示词
+// 原样出站 → 上游整单拦截 → 网关按「内容拦截」误分类走降级重试（把 system
+// 整体换成中性提示词，DSH 的 agent 能力被削掉），而换号无济于事。
+func TestDeepSeekHarnessBrandRewritten(t *testing.T) {
+	in := "You are an AI agent powered by DeepSeek Harness.\n\nCheck the exit code."
+	out := sanitizeTextIdentity(in)
+	if strings.Contains(out, "DeepSeek Harness") || !strings.Contains(out, "DeepSeekRuntime") {
+		t.Fatalf("brand word not rewritten: %q", out)
+	}
+	if !strings.HasPrefix(out, "You are an AI agent powered by DeepSeekRuntime.") {
+		t.Errorf("surrounding text changed: %q", out)
+	}
+	if again := sanitizeTextIdentity(out); again != out {
+		t.Errorf("not idempotent: %q -> %q", out, again)
+	}
+}
+
+// 预检快路径：文本只含品牌词、不含任何其它指纹，也必须进入净化。
+// 同时钉住「品牌词不进全局快路径」——否则 brand=false 的路径会对用户文本
+// 做 TrimSpace（裁掉首尾空白），改动用户数据。
+func TestDeepSeekHarnessDetected(t *testing.T) {
+	in := "You are interacting through the DeepSeek Harness Web GUI."
+	if hasFingerprint(in) {
+		t.Error("brand word should NOT hit the global fast path（否则非身份消息会被 TrimSpace/改写）")
+	}
+	if !hasIdentityFingerprint(in) {
+		t.Error("brand word should hit the identity fast path")
+	}
+}
+
+// 走完出站管线全链路：system 与 user 里的品牌词都在出站前改掉。
+func TestPrepareBodyRewritesDeepSeekHarness(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[` +
+		`{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."},` +
+		`{"role":"user","content":"the DeepSeek Harness checkout is here"}]}`)
+	out := prepareBodyOpt(body, true, true, nil, nil)
+	if strings.Contains(string(out), "DeepSeek Harness") {
+		t.Fatalf("brand word survived: %s", out)
+	}
+	if strings.Count(string(out), "DeepSeekRuntime") != 2 {
+		t.Errorf("expected both messages rewritten: %s", out)
+	}
+}
+
+// 默认作用域（all）：与上游既有行为一致，所有消息角色的品牌词都改写。
+func TestBrandScopeAllRewritesUserMessages(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "system", "content": "You are DeepSeek Harness."},
+		map[string]any{"role": "user", "content": "read DeepSeek Harness docs"},
+	}
+	if !sanitizeMessages(msgs, true) {
+		t.Fatal("sanitizeMessages all: 未报告改动")
+	}
+	for i, m := range msgs {
+		if got := m.(map[string]any)["content"].(string); strings.Contains(got, "DeepSeek Harness") {
+			t.Errorf("msg[%d] 品牌词未改写: %q", i, got)
+		}
+	}
+}
+
+// identity 作用域：只改 system/developer，用户/工具/assistant 内容（含
+// tool_calls 参数与 reasoning）按用户数据原样透传。
+func TestBrandScopeIdentityLeavesUserMessages(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "system", "content": "You are DeepSeek Harness."},
+		map[string]any{"role": "user", "content": "  DeepSeek Harness  "},
+		map[string]any{"role": "assistant", "content": nil,
+			"tool_calls": []any{map[string]any{"id": "c1", "function": map[string]any{
+				"name": "Read", "arguments": `{"path":"DeepSeek Harness.md"}`,
+			}}},
+		},
+	}
+	if !sanitizeMessages(msgs, false) {
+		t.Fatal("sanitizeMessages identity: system 未改写")
+	}
+	if got := msgs[0].(map[string]any)["content"].(string); !strings.Contains(got, "DeepSeekRuntime") {
+		t.Errorf("system 品牌词未改写: %q", got)
+	}
+	if got := msgs[1].(map[string]any)["content"].(string); got != "  DeepSeek Harness  " {
+		t.Errorf("user 内容被改动（应原样含首尾空白）: %q", got)
+	}
+	args := msgs[2].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)["arguments"].(string)
+	if !strings.Contains(args, "DeepSeek Harness") {
+		t.Errorf("tool_calls 参数被改动: %q", args)
+	}
+}
+
+// identity 作用域下 system 消息仍然必须改写（品牌词的原始拦截位置就是
+// system 提示词）——这条钉住「identity 只缩到身份消息，不是缩到零」。
+func TestBrandScopeIdentityStillRewritesSystem(t *testing.T) {
+	msgs := []any{
+		map[string]any{"role": "developer", "content": "You are DeepSeek Harness."},
+	}
+	if !sanitizeMessages(msgs, false) {
+		t.Fatal("developer 消息未改写")
+	}
+	if got := msgs[0].(map[string]any)["content"].(string); strings.Contains(got, "DeepSeek Harness") {
+		t.Errorf("developer 品牌词未改写: %q", got)
+	}
+}
+
+// 默认作用域：Client 未配置作用域时按 all 处理。
+func TestBrandScopeDefaultGlobal(t *testing.T) {
+	var c Client
+	c.SanitizeFingerprints.Store(true)
+	if !c.brandScopeGlobal() {
+		t.Error("默认应为 all（brandScopeGlobal=true）")
+	}
+	c.SanitizeBrandScope.Store("identity")
+	if c.brandScopeGlobal() {
+		t.Error("identity 应返回 false")
+	}
+	c.SanitizeBrandScope.Store("")
+	if !c.brandScopeGlobal() {
+		t.Error("空值应回落 all")
+	}
+}
+
+// 出站边界集成：DSH 的品牌词绝不能出现在发往上游的 wire body 里。
+//
+// 这是本条修复的最终判据——中间层（prepareBodyOpt）改对了还不够，只有线上
+// 出站的字节里没有 "DeepSeek Harness"，上游才不会按「非官方渠道调用」整单
+// 拦截（400 11-128）。
+func TestChatStreamWireBodyBrandRewritten(t *testing.T) {
+	var gotBody []byte
+	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	})
+	defer ts.Close()
+
+	c := New()
+	c.SanitizeFingerprints.Store(true)
+	c.ChatBaseCN = ts.URL
+	acct := &auth.Auth{AccessToken: "test-token", Domain: "copilot.tencent.com", UID: "u1"}
+
+	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[` +
+		`{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."},` +
+		`{"role":"user","content":"hi"}]}`)
+	rc, status, respBody, err := c.ChatStream(acct, body, "", ChatMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if status >= 400 {
+		t.Fatalf("upstream status %d: %s", status, respBody)
+	}
+	if strings.Contains(string(gotBody), "DeepSeek Harness") {
+		t.Fatalf("brand word leaked to upstream wire body: %s", gotBody)
+	}
+	if !strings.Contains(string(gotBody), "DeepSeekRuntime") {
+		t.Fatalf("brand word not rewritten on wire body: %s", gotBody)
+	}
+}
+
+// identity 作用域下，wire body 里的品牌词只该在 system 消息处消失；
+// user 消息里的同名文本必须原样透传（用户数据不被改写）。
+func TestChatStreamWireBodyBrandScopeIdentity(t *testing.T) {
+	var gotBody []byte
+	ts := newTestUpstream(t, func(w http.ResponseWriter, r *http.Request) {
+		gotBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	})
+	defer ts.Close()
+
+	c := New()
+	c.SanitizeFingerprints.Store(true)
+	c.SanitizeBrandScope.Store("identity")
+	c.ChatBaseCN = ts.URL
+	acct := &auth.Auth{AccessToken: "test-token", Domain: "copilot.tencent.com", UID: "u1"}
+
+	body := []byte(`{"model":"deepseek-v4.1-flash","messages":[` +
+		`{"role":"system","content":"You are an AI agent powered by DeepSeek Harness."},` +
+		`{"role":"user","content":"tell me about DeepSeek Harness"}]}`)
+	rc, status, respBody, err := c.ChatStream(acct, body, "", ChatMeta{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+	if status >= 400 {
+		t.Fatalf("upstream status %d: %s", status, respBody)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(gotBody, &obj); err != nil {
+		t.Fatalf("wire body not json: %v", err)
+	}
+	msgs := obj["messages"].([]any)
+	sys, _ := msgs[0].(map[string]any)["content"].(string)
+	if strings.Contains(sys, "DeepSeek Harness") {
+		t.Errorf("system 品牌词未改写: %q", sys)
+	}
+	usr, _ := msgs[1].(map[string]any)["content"].(string)
+	if !strings.Contains(usr, "DeepSeek Harness") {
+		t.Errorf("user 消息被改写（identity 作用域应原样透传）: %q", usr)
+	}
 }

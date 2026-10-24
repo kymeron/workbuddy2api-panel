@@ -22,6 +22,23 @@ var sanitizeFeatures = []string{
 	"11128",                                           // 上游反探测：裸数字错误码
 }
 
+// sanitizeIdentityFeatures 身份类特征：品牌词（DSH 客户端身份句里的品牌词）。
+//
+// 与 sanitizeFeatures 分表的原因：品牌词的判定口径与其它指纹不同——
+//   - 其它指纹（cc_xxx / Claude Code 身份句 / 裸 11128）是**上游黑名单**里的
+//     字符串，命中即整单拦截，必须在所有消息角色上一律清除；
+//   - 品牌词是**客户端自报身份**，上游按逐字匹配把它当成「非官方渠道调用」
+//     整单拦截（400 11-128 Illegal API invocation from an unapproved channel）。
+//     但它同时可能是用户数据（用户就是在讨论 DeepSeek Harness 这个产品），
+//     是否改写由 features.sanitize_brand_scope 决定（见 sanitizeMessages）。
+//
+// 单独成表还为了守住快路径：品牌词若混进 sanitizeFeatures，hasFingerprint
+// 就会对只含品牌词的文本返回 true，brand=false 的路径也会进入清洗
+// （末尾 TrimSpace 会裁掉用户文本首尾空白）。
+var sanitizeIdentityFeatures = []string{
+	"DeepSeek Harness",
+}
+
 // sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
 var sanitizeHdrRe = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
 
@@ -78,13 +95,45 @@ var sanitizeRewrites = [][2]string{
 	},
 }
 
-// sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
-func sanitizeText(text string) string {
-	if !hasFingerprint(text) {
+// sanitizeIdentityRewrites 身份类改写：品牌词 → DeepSeekRuntime。仅在应用身份类
+// 规则时使用（见 sanitizeTextWith：brandGlobal=true 时所有角色都用，
+// brandGlobal=false 时只用身份消息）。
+//
+// 换一词即绕过，语义不变：上游按逐字匹配拦截「DeepSeek Harness」这个品牌串，
+// 改成同长度的 DeepSeekRuntime 后逐字匹配不再命中，而句子语义不变。
+var sanitizeIdentityRewrites = [][2]string{
+	{
+		// DSH 的身份句（@deepseek-ai/dsh-system-prompt 注入的 harness:identity 段）
+		// 被上游当成「非官方渠道调用」整单拦截：400 11-128 Illegal API invocation
+		// from an unapproved channel。实测换一词即绕过（与插 U+200B 等效，但可见、
+		// 可 diff）。上游命中的是**品牌词本身**而非整句，故按短语全局替换。
+		"DeepSeek Harness",
+		"DeepSeekRuntime",
+	},
+}
+
+// sanitizeText 单段文本净化（全局规则）：预检不中 → 返回原串（零分配）。
+func sanitizeText(text string) string { return sanitizeTextWith(text, false) }
+
+// sanitizeTextIdentity 身份消息（system/developer）专用：在全局规则之外再应用身份类
+// 规则（品牌词）。brandGlobal=true 时非身份消息也走这条（与上游既有行为一致）。
+func sanitizeTextIdentity(text string) string { return sanitizeTextWith(text, true) }
+
+// sanitizeTextWith 按「是否应用身份类规则」净化单段文本。
+//
+// 快路径同时看两类特征：只含品牌词的文本在 brand=false 时原样返回（不 TrimSpace，
+// 用户输入的空白不动），在 brand=true 时进入改写。
+func sanitizeTextWith(text string, brand bool) string {
+	if !hasFingerprint(text) && !(brand && hasIdentityFingerprint(text)) {
 		return text
 	}
 	for _, rw := range sanitizeRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
+	}
+	if brand {
+		for _, rw := range sanitizeIdentityRewrites {
+			text = strings.ReplaceAll(text, rw[0], rw[1])
+		}
 	}
 	if sanitizeHdrRe.MatchString(text) {
 		text = sanitizeHdrRe.ReplaceAllString(text, "")
@@ -99,6 +148,17 @@ func sanitizeText(text string) string {
 	// 兜底：键值形态已在上面整段删除，这里只剩裸键名（引用/示例文本形态）。
 	text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
 	return strings.TrimSpace(text)
+}
+
+// hasIdentityFingerprint 身份类特征（品牌词）预检；只在需要应用身份类规则时调用，
+// 保证 brand=false 的路径不会因为只含品牌词而进入清洗（否则末尾 TrimSpace 会裁掉用户空白）。
+func hasIdentityFingerprint(text string) bool {
+	for _, f := range sanitizeIdentityFeatures {
+		if strings.Contains(text, f) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasFingerprint 特征预检：先走 strings.Contains 快速路径（零分配）；
@@ -117,10 +177,11 @@ func hasFingerprint(text string) bool {
 
 // sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
 // 返回净化后的值及是否发生变化。
-func sanitizeContent(v any) (any, bool) {
+// brand 为 false 时不应用身份类规则（见 sanitizeMessages 的作用域选择）。
+func sanitizeContent(v any, brand bool) (any, bool) {
 	switch c := v.(type) {
 	case string:
-		s := sanitizeText(c)
+		s := sanitizeTextWith(c, brand)
 		return s, s != c
 	case []any:
 		changed := false
@@ -133,7 +194,7 @@ func sanitizeContent(v any) (any, bool) {
 			if !ok {
 				continue
 			}
-			if s := sanitizeText(text); s != text {
+			if s := sanitizeTextWith(text, brand); s != text {
 				m["text"] = s
 				changed = true
 			}
@@ -149,7 +210,7 @@ func sanitizeContent(v any) (any, bool) {
 // 这块长期是盲区：工具调用消息的 content 通常是 null，而旧版 sanitizeMessages
 // 在 content 缺失时直接 continue，整条消息连 tool_calls 一起被跳过——
 // 于是历史里任何写进工具参数的被拦字符串（文件名、命令、写入内容）都会原样漏出。
-func sanitizeToolCalls(v any) bool {
+func sanitizeToolCalls(v any, brand bool) bool {
 	callList, ok := v.([]any)
 	if !ok {
 		return false
@@ -168,7 +229,7 @@ func sanitizeToolCalls(v any) bool {
 		if !ok {
 			continue
 		}
-		if s := sanitizeText(args); s != args {
+		if s := sanitizeTextWith(args, brand); s != args {
 			fn["arguments"] = s
 			changed = true
 		}
@@ -177,17 +238,25 @@ func sanitizeToolCalls(v any) bool {
 }
 
 // sanitizeMessages 净化 messages 中的 content 与 tool_calls；任一命中返回 true。
-func sanitizeMessages(messages []any) bool {
+//
+// brandGlobal 来自 features.sanitize_brand_scope：true（默认 "all"）时身份类规则对所有
+// 消息角色生效，与上游既有行为一致；false（"identity"）时只对 system/developer 生效，
+// 其余角色的同名文本按用户数据原样透传（实测 user 里的品牌词不触发 11-128）。
+func sanitizeMessages(messages []any, brandGlobal bool) bool {
 	changed := false
 	for _, msg := range messages {
 		m, ok := msg.(map[string]any)
 		if !ok {
 			continue
 		}
+		role, _ := m["role"].(string)
+		identity := strings.EqualFold(strings.TrimSpace(role), "system") ||
+			strings.EqualFold(strings.TrimSpace(role), "developer")
+		brand := brandGlobal || identity
 		// content 与 tool_calls 各自独立判断：content 可以为 null（工具调用轮），
 		// 早期版本在此 continue，导致这类消息的 tool_calls 完全不被净化。
 		if c, ok := m["content"]; ok {
-			if nc, ch := sanitizeContent(c); ch {
+			if nc, ch := sanitizeContent(c, brand); ch {
 				m["content"] = nc
 				changed = true
 			}
@@ -195,7 +264,7 @@ func sanitizeMessages(messages []any) bool {
 		// reasoning_content（思维链回填字段，见 thinking.go/sse.go）实测同样
 		// 携带指纹，与 content 同等净化。string 形态直接走 sanitizeText。
 		if rc, ok := m["reasoning_content"].(string); ok {
-			if s := sanitizeText(rc); s != rc {
+			if s := sanitizeTextWith(rc, brand); s != rc {
 				m["reasoning_content"] = s
 				changed = true
 			}
@@ -205,13 +274,13 @@ func sanitizeMessages(messages []any) bool {
 		// reasoning_content / tool_calls —— 镜像进 reasoning 的指纹原样出站，
 		// 裸 "11128" 这种反探测串同样致命。
 		if r, ok := m["reasoning"].(string); ok {
-			if s := sanitizeText(r); s != r {
+			if s := sanitizeTextWith(r, brand); s != r {
 				m["reasoning"] = s
 				changed = true
 			}
 		}
 		if tc, ok := m["tool_calls"]; ok {
-			if sanitizeToolCalls(tc) {
+			if sanitizeToolCalls(tc, brand) {
 				changed = true
 			}
 		}

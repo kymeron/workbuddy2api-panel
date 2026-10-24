@@ -27,7 +27,17 @@ func PrepareBodyOptWithEfforts(src []byte, sanitize bool, efforts map[string][]s
 // PrepareBodyOptWithEffortsAndDefault 完整管线：efforts 降级 + thinking.go 按
 // defaultEfforts（模型声明默认档）补档。defaultEfforts 为 nil 时与旧行为一致
 // （deepseek 缺档回退硬编码 high）。
+//
+// 身份类规则（品牌词）作用域固定为 all（与上游既有行为一致）；生产路径要按
+// features.sanitize_brand_scope 取值，走 prepareBodyOpt。
 func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
+	return prepareBodyOpt(src, sanitize, true, efforts, defaultEfforts)
+}
+
+// prepareBodyOpt 完整管线本体。brandGlobal 控制身份类规则（品牌词）的作用域：
+// true = 所有消息角色（默认，与上游既有行为一致）；false = 仅 system/developer
+// （features.sanitize_brand_scope=identity），其余角色按用户数据原样透传。
+func prepareBodyOpt(src []byte, sanitize, brandGlobal bool, efforts map[string][]string, defaultEfforts map[string]string) []byte {
 	if len(src) == 0 {
 		return src
 	}
@@ -82,7 +92,7 @@ func PrepareBodyOptWithEffortsAndDefault(src []byte, sanitize bool, efforts map[
 	backfillReasoningContent(obj)
 	if sanitize {
 		if msgs, ok := obj["messages"].([]any); ok {
-			sanitizeMessages(msgs)
+			sanitizeMessages(msgs, brandGlobal)
 		}
 	}
 	out, err := json.Marshal(obj)

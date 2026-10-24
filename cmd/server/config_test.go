@@ -859,3 +859,50 @@ func TestServerReadTimeout(t *testing.T) {
 		t.Error("unparsable read_timeout should fail fast")
 	}
 }
+
+// 品牌词规则作用域（features.sanitize_brand_scope）：
+//   - 缺省 "all"（与上游既有行为一致，所有消息角色都改写品牌词）；
+//   - "identity" 只改 system/developer；
+//   - 非法值必须报错（静默回落会悄悄改写用户数据，或让本该拦下的请求出站）。
+func TestBrandScopeDefaultAll(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.SanitizeBrandScope != "all" {
+		t.Errorf("default scope=%q want all", c.Features.SanitizeBrandScope)
+	}
+}
+
+func TestBrandScopeFromFile(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"features":{"sanitize_brand_scope":"identity"}}`), 0o600)
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.SanitizeBrandScope != "identity" {
+		t.Errorf("scope=%q want identity", c.Features.SanitizeBrandScope)
+	}
+}
+
+func TestBrandScopeEnvOverride(t *testing.T) {
+	t.Setenv("WB2A_SANITIZE_BRAND_SCOPE", "identity")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Features.SanitizeBrandScope != "identity" {
+		t.Errorf("scope=%q want identity", c.Features.SanitizeBrandScope)
+	}
+}
+
+func TestBadBrandScope(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "c.json")
+	os.WriteFile(fp, []byte(`{"features":{"sanitize_brand_scope":"nonsense"}}`), 0o600)
+	if _, err := Load(fp); err == nil {
+		t.Fatal("want error for bad sanitize_brand_scope")
+	}
+}

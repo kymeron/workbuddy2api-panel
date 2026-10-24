@@ -172,6 +172,9 @@ type Config struct {
 	Features struct {
 		// SanitizeBlacklistFingerprints 出站请求体黑名单指纹脱敏（默认 true；false 完全还原）。
 		SanitizeBlacklistFingerprints bool `json:"sanitize_blacklist_fingerprints"`
+		// SanitizeBrandScope 身份类规则（品牌词）作用域："all" = 所有消息角色（默认，与上游既有行为一致）；
+		// "identity" = 仅 system/developer，其余角色按用户数据原样透传（features.sanitize_brand_scope）。
+		SanitizeBrandScope string `json:"sanitize_brand_scope"`
 	} `json:"features"`
 
 	Models struct {
@@ -310,6 +313,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
+	c.Features.SanitizeBrandScope = "all"
 	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
 	c.Pool.Strategy = pool.RegionStrategies{Domestic: pool.WeightedRandom, International: pool.WeightedRandom}
 	c.Pool.MaxInFlight = 3
@@ -473,6 +477,9 @@ func applyEnv(c *Config) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.Features.SanitizeBlacklistFingerprints = b
 		}
+	}
+	if v := os.Getenv("WB2A_SANITIZE_BRAND_SCOPE"); v != "" {
+		c.Features.SanitizeBrandScope = v
 	}
 	if v := os.Getenv("WB2A_PROMPT_MODE"); v != "" {
 		c.Prompt.Mode = v
@@ -646,7 +653,30 @@ func (c *Config) normalize() error {
 	if err := c.validateScheduleHours(); err != nil {
 		return err
 	}
+	if err := c.normalizeBrandScope(); err != nil {
+		return err
+	}
 	return c.normalizePrompt()
+}
+
+// normalizeBrandScope 校验 features.sanitize_brand_scope（身份类规则作用域）。
+//
+// 非法值报错而非静默回落：作用域决定「品牌词要不要在 user / assistant / tool
+// 历史里一并改写」——静默回落成 "all" 会悄悄改写用户数据（用户可能在讨论
+// DeepSeek Harness 这个产品本身），回落成 "identity" 则可能让本该拦下的
+// 请求出站。两种都不是无害的默认值，故 fail fast。
+//
+// 空值回落 "all"（与上游既有行为一致）；大小写不敏感。
+func (c *Config) normalizeBrandScope() error {
+	switch s := strings.ToLower(strings.TrimSpace(c.Features.SanitizeBrandScope)); s {
+	case "", "all":
+		c.Features.SanitizeBrandScope = "all"
+	case "identity":
+		c.Features.SanitizeBrandScope = "identity"
+	default:
+		return fmt.Errorf("features.sanitize_brand_scope: %q 非法（all = 所有消息角色；identity = 仅 system/developer）", c.Features.SanitizeBrandScope)
+	}
+	return nil
 }
 
 // normalizePrompt 校验 prompt.mode 并按 file 加载提示词文本（custom/append 模式）。
